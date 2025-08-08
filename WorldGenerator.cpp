@@ -1,6 +1,6 @@
 #include "WorldGenerator.h"
 #include "World.h"
-#include "FastNoiseLite.h"
+#include "FastNoiseLite/FastNoiseLite.h"
 #include <cmath>
 
 #ifndef PI
