@@ -27,25 +27,33 @@ const int PARTICLE_GRID_SIZE = 300;
 const int PARTICLE_SPACING_KM = 6;
 const bool VISUALIZE_FAULTS = true;
 
-// Staged simulation control
+// MODIFICATION: Simplified to a 3-stage process, removing the destructive final isostasy step.
 enum SimulationState {
-    TECTONICS,          // Stage 1: Crustal thickening and stress accumulation
-    FRACTURING,         // Stage 2: One-shot fault generation
-    ISOSTATIC_SETTLING, // Stage 3: Let the thickened crust rise to equilibrium
-    DONE                // Simulation finished
+    TECTONICS_INITIAL,      // Stage 1: Initial large-scale mountain building.
+    FRACTURING,             // Stage 2: Major fault systems are generated based on initial stress.
+    TECTONICS_REACTIVATION, // Stage 3: Continued tectonics, where old faults are reactivated, leading to the final terrain.
+    DONE                    // Simulation finished
 };
-// MODIFIED: Increased the duration of the tectonics phase to allow for more mature mountain formation.
-const int TECTONICS_STEPS = 3000; // Was 1500
-const int ISOSTATIC_SETTLING_STEPS = 500;
+// MODIFICATION: Explicitly define durations for each tectonic phase.
+const int INITIAL_TECTONICS_DURATION = 2500;
+const int REACTIVATION_DURATION = 1250; // Shortened from 2500 to 1250 as requested.
 
+// =================================================================
+// Particle Struct
+// =================================================================
 struct Particle {
     glm::vec3 position;
     glm::vec3 velocity;
-    float mass; // Represents density now
+    float mass; // Represents density
     int plateID;
     float cohesion = 1.0f;
     glm::vec2 stress = glm::vec2(0.0f);
     float crustThickness = 0.0f;
+
+    float rigidity = 0.5f;
+    float initial_rigidity = 0.5f;
+
+    float subduction_pull = 0.0f;
 };
 
 struct NoiseOctave {
@@ -66,7 +74,7 @@ private:
     std::vector<NoiseOctave> m_mantleNoiseY;
     std::mt19937 m_rng;
 
-    SimulationState m_currentState = TECTONICS;
+    SimulationState m_currentState = TECTONICS_INITIAL;
     int m_stepCount = 0;
 
     Color lerp(Color a, Color b, float t) {
@@ -94,12 +102,7 @@ private:
         }
         if (maxElevation <= minElevation) maxElevation = minElevation + 1.0f;
 
-        const float seaLevelRatio = 0.15f;
-        const float seaLevel = minElevation + (maxElevation - minElevation) * seaLevelRatio;
-
-        const Color DEEP_OCEAN = { 10, 40, 80, 255 };
-        const Color SHALLOW_OCEAN = { 80, 150, 200, 255 };
-        const Color BEACH = { 210, 195, 150, 255 };
+        const Color LOWEST_LAND = { 34, 85, 51, 255 };
         const Color LOWLAND_GREEN = { 70, 110, 40, 255 };
         const Color UPLAND_ARID = { 160, 140, 90, 255 };
         const Color ROCKY_MOUNTAIN = { 130, 120, 110, 255 };
@@ -111,33 +114,19 @@ private:
                 float elevation = p.position.z;
                 Color color;
 
-                if (elevation < seaLevel) {
-                    float waterDepthRatio = 1.0f;
-                    if (seaLevel > minElevation) {
-                        waterDepthRatio = (elevation - minElevation) / (seaLevel - minElevation);
-                    }
-                    color = lerp(DEEP_OCEAN, SHALLOW_OCEAN, waterDepthRatio);
+                float heightRatio = (elevation - minElevation) / (maxElevation - minElevation);
+
+                if (heightRatio < 0.25f) {
+                    color = lerp(LOWEST_LAND, LOWLAND_GREEN, heightRatio / 0.25f);
+                }
+                else if (heightRatio < 0.5f) {
+                    color = lerp(LOWLAND_GREEN, UPLAND_ARID, (heightRatio - 0.25f) / 0.25f);
+                }
+                else if (heightRatio < 0.75f) {
+                    color = lerp(UPLAND_ARID, ROCKY_MOUNTAIN, (heightRatio - 0.5f) / 0.25f);
                 }
                 else {
-                    float landHeightRatio = 0.0f;
-                    if (maxElevation > seaLevel) {
-                        landHeightRatio = (elevation - seaLevel) / (maxElevation - seaLevel);
-                    }
-                    if (landHeightRatio < 0.02f) {
-                        color = BEACH;
-                    }
-                    else if (landHeightRatio < 0.25f) {
-                        color = lerp(BEACH, LOWLAND_GREEN, (landHeightRatio - 0.02f) / 0.23f);
-                    }
-                    else if (landHeightRatio < 0.5f) {
-                        color = lerp(LOWLAND_GREEN, UPLAND_ARID, (landHeightRatio - 0.25f) / 0.25f);
-                    }
-                    else if (landHeightRatio < 0.75f) {
-                        color = lerp(UPLAND_ARID, ROCKY_MOUNTAIN, (landHeightRatio - 0.75f) / 0.25f);
-                    }
-                    else {
-                        color = lerp(ROCKY_MOUNTAIN, SNOW_CAP, (landHeightRatio - 0.75f) / 0.25f);
-                    }
+                    color = lerp(ROCKY_MOUNTAIN, SNOW_CAP, (heightRatio - 0.75f) / 0.25f);
                 }
 
                 DrawRectangle(
@@ -145,7 +134,7 @@ private:
                     static_cast<int>(particleWidth + 1.0f), static_cast<int>(particleHeight + 1.0f), color
                 );
 
-                if (VISUALIZE_FAULTS && m_faultZoneMap[i][j] > 0.0f && m_currentState != TECTONICS) {
+                if (VISUALIZE_FAULTS && m_faultZoneMap[i][j] > 0.0f && m_currentState != TECTONICS_INITIAL) {
                     float strength = m_faultZoneMap[i][j];
                     Color faultColor = { 255, (unsigned char)(255 * (1.0f - strength)), 0, (unsigned char)(strength * 150) };
                     DrawRectangle(
@@ -156,19 +145,20 @@ private:
             }
         }
 
+        // MODIFICATION: Updated status text to use new duration constants.
         std::string statusText;
         int progress = 0;
         switch (m_currentState) {
-        case TECTONICS:
-            progress = (int)(((float)m_stepCount / TECTONICS_STEPS) * 100);
-            statusText = "Stage 1/3: Tectonics (" + std::to_string(progress) + "%)";
+        case TECTONICS_INITIAL:
+            progress = (int)(((float)m_stepCount / INITIAL_TECTONICS_DURATION) * 100);
+            statusText = "Stage 1/3: Initial Tectonics (" + std::to_string(progress) + "%)";
             break;
         case FRACTURING:
             statusText = "Stage 2/3: Generating Faults...";
             break;
-        case ISOSTATIC_SETTLING:
-            progress = (int)(((float)(m_stepCount - TECTONICS_STEPS) / ISOSTATIC_SETTLING_STEPS) * 100);
-            statusText = "Stage 3/3: Isostatic Settling (" + std::to_string(progress) + "%)";
+        case TECTONICS_REACTIVATION:
+            progress = (int)(((float)(m_stepCount - INITIAL_TECTONICS_DURATION) / REACTIVATION_DURATION) * 100);
+            statusText = "Stage 3/3: Tectonic Reactivation (" + std::to_string(progress) + "%)";
             break;
         case DONE:
             statusText = "Generation Complete.";
@@ -195,25 +185,28 @@ public:
         omp_set_num_threads(12);
 
         const int SIM_STEPS_PER_FRAME = 10;
+        // MODIFICATION: Use new duration constants to define phase boundaries.
+        const int TECTONICS_PHASE_1_STEPS = INITIAL_TECTONICS_DURATION;
+        const int TECTONICS_PHASE_2_STEPS = INITIAL_TECTONICS_DURATION + REACTIVATION_DURATION;
 
         while (!WindowShouldClose()) {
             if (m_currentState != DONE) {
                 for (int i = 0; i < SIM_STEPS_PER_FRAME; ++i) {
-                    if (m_currentState == TECTONICS) {
+                    if (m_currentState == TECTONICS_INITIAL) {
                         simulateStep_Tectonics(dt);
-                        if (m_stepCount >= TECTONICS_STEPS) {
+                        if (m_stepCount >= TECTONICS_PHASE_1_STEPS) {
                             m_currentState = FRACTURING;
                             break;
                         }
                     }
                     else if (m_currentState == FRACTURING) {
                         generateFaultsFromStressMap();
-                        m_currentState = ISOSTATIC_SETTLING;
+                        m_currentState = TECTONICS_REACTIVATION;
                         break;
                     }
-                    else if (m_currentState == ISOSTATIC_SETTLING) {
-                        simulateStep_Isostasy(dt);
-                        if (m_stepCount >= TECTONICS_STEPS + ISOSTATIC_SETTLING_STEPS) {
+                    else if (m_currentState == TECTONICS_REACTIVATION) {
+                        simulateStep_Tectonics(dt);
+                        if (m_stepCount >= TECTONICS_PHASE_2_STEPS) {
                             m_currentState = DONE;
                             break;
                         }
@@ -249,6 +242,9 @@ private:
                 p.cohesion = 1.0f;
                 p.stress = glm::vec2(0.0f);
                 p.crustThickness = 0.0f;
+                p.rigidity = 0.5f;
+                p.initial_rigidity = 0.5f;
+                p.subduction_pull = 0.0f;
             }
         }
     }
@@ -291,24 +287,37 @@ private:
     }
 
     void finalizeInitialization() {
-        const float MIN_DENSITY = 2700.0f;
-        const float MAX_DENSITY = 3000.0f;
-        const float MIN_THICKNESS = 7.0f;
-        const float MAX_THICKNESS = 35.0f;
+        const float OCEANIC_CRUST_DENSITY = 2950.0f;
+        const float CONTINENTAL_CRUST_DENSITY = 2750.0f;
+        const float OCEANIC_CRUST_THICKNESS = 10.0f;
+        const float CONTINENTAL_CRUST_THICKNESS = 40.0f;
+        const float MIN_RIGIDITY = 0.2f;
+        const float MAX_RIGIDITY = 0.8f;
 
         FastNoiseLite property_noise;
         property_noise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
         property_noise.SetFrequency(0.01f);
         property_noise.SetSeed(2026);
 
+        FastNoiseLite rigidity_noise;
+        rigidity_noise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
+        rigidity_noise.SetFrequency(0.02f);
+        rigidity_noise.SetSeed(2027);
+
 #pragma omp parallel for
         for (int i = 0; i < PARTICLE_GRID_SIZE; ++i) {
             for (int j = 0; j < PARTICLE_GRID_SIZE; ++j) {
                 Particle& p = m_particleGrid[i][j];
-                float noise_val = property_noise.GetNoise((float)i, (float)j);
-                float t = (noise_val + 1.0f) * 0.5f;
-                p.mass = MIN_DENSITY + (MAX_DENSITY - MIN_DENSITY) * t;
-                p.crustThickness = MAX_THICKNESS - (MAX_THICKNESS - MIN_THICKNESS) * t;
+
+                float continental_factor = (property_noise.GetNoise((float)i, (float)j) + 1.0f) * 0.5f;
+
+                p.mass = OCEANIC_CRUST_DENSITY + (CONTINENTAL_CRUST_DENSITY - OCEANIC_CRUST_DENSITY) * continental_factor;
+                p.crustThickness = OCEANIC_CRUST_THICKNESS + (CONTINENTAL_CRUST_THICKNESS - CONTINENTAL_CRUST_THICKNESS) * continental_factor;
+
+                float rigidity_t = (rigidity_noise.GetNoise((float)i, (float)j) + 1.0f) * 0.5f;
+                p.rigidity = MIN_RIGIDITY + (MAX_RIGIDITY - MIN_RIGIDITY) * rigidity_t;
+                p.initial_rigidity = p.rigidity;
+
                 p.position.z = getIsostaticEquilibriumZ(p);
             }
         }
@@ -375,7 +384,15 @@ private:
         glm::ivec2 current_pos = start_pos;
         for (int i = 0; i < max_length; ++i) {
             if (current_pos.x < 0 || current_pos.x >= PARTICLE_GRID_SIZE || current_pos.y < 0 || current_pos.y >= PARTICLE_GRID_SIZE) break;
-            m_particleGrid[current_pos.x][current_pos.y].cohesion = std::min(m_particleGrid[current_pos.x][current_pos.y].cohesion, cohesion);
+
+            Particle& p = m_particleGrid[current_pos.x][current_pos.y];
+
+            if (p.cohesion > cohesion) {
+                p.cohesion = cohesion;
+                p.rigidity *= (0.5f + p.cohesion * 0.5f);
+                p.rigidity = std::max(0.05f, p.rigidity);
+            }
+
             glm::vec2 random_dir = glm::normalize(glm::vec2(dist_float(m_rng) - 0.5f, dist_float(m_rng) - 0.5f));
             current_dir = glm::normalize(current_dir * 0.8f + random_dir * 0.2f);
             current_pos.x += static_cast<int>(round(current_dir.x));
@@ -438,6 +455,7 @@ private:
         const float DAMPING_COEFFICIENT = 0.5f;
         const float MANTLE_DRAG_SCALE = 7000.0f;
         const float ISOSTATIC_REBOUND_SCALE = 0.05f;
+        const float FAULT_DEPRESSION_SCALE = 20.0f;
 
 #pragma omp parallel for
         for (int i = 0; i < PARTICLE_GRID_SIZE; ++i) {
@@ -445,14 +463,21 @@ private:
                 Particle& p = m_particleGrid[i][j];
                 if (p.plateID == -1) continue;
 
+                // Horizontal forces from mantle drag
                 float total_mantle_vel_x = 0.0f, total_mantle_vel_y = 0.0f;
                 for (const auto& octave : m_mantleNoiseX) { total_mantle_vel_x += octave.noise.GetNoise(p.position.x, p.position.y) * octave.amplitude; }
                 for (const auto& octave : m_mantleNoiseY) { total_mantle_vel_y += octave.noise.GetNoise(p.position.x, p.position.y) * octave.amplitude; }
                 forces[i][j].x += total_mantle_vel_x * MANTLE_DRAG_SCALE;
                 forces[i][j].y += total_mantle_vel_y * MANTLE_DRAG_SCALE;
 
+                // Vertical forces
                 if (useIsostasy) {
                     float target_z = getIsostaticEquilibriumZ(p);
+                    target_z -= p.subduction_pull;
+                    if (m_faultZoneMap[i][j] > 0.0f) {
+                        float fault_influence = m_faultZoneMap[i][j];
+                        target_z -= fault_influence * FAULT_DEPRESSION_SCALE * p.cohesion;
+                    }
                     forces[i][j].z += (target_z - p.position.z) * ISOSTATIC_REBOUND_SCALE;
                 }
 
@@ -481,6 +506,14 @@ private:
     }
 
     void simulateStep_Tectonics(float dt) {
+        // --- Decay subduction pull over time ---
+#pragma omp parallel for
+        for (int i = 0; i < PARTICLE_GRID_SIZE; ++i) {
+            for (int j = 0; j < PARTICLE_GRID_SIZE; ++j) {
+                m_particleGrid[i][j].subduction_pull *= 0.95f;
+            }
+        }
+
         std::vector<std::vector<glm::vec3>> forces(PARTICLE_GRID_SIZE, std::vector<glm::vec3>(PARTICLE_GRID_SIZE, glm::vec3(0.0f)));
         applyUniversalForces(forces, true);
 
@@ -488,10 +521,14 @@ private:
         const float REST_LENGTH = PARTICLE_SPACING_KM;
         const float HORIZONTAL_PRESSURE_SCALE = 90.0f;
         const float THICKENING_RATE = 0.05f;
-        const float DENSITY_DIFF_THRESHOLD = 1.05f;
-        const float THICKNESS_RESISTANCE_SCALE = 120.0f;
+        const float MAX_CRUST_THICKNESS = 100.0f;
+        const float RIFTING_THINNING_RATE = 0.01f;
+        const float MIN_CRUST_THICKNESS = 5.0f;
 
+        std::vector<std::vector<float>> continentalStressGrid(PARTICLE_GRID_SIZE, std::vector<float>(PARTICLE_GRID_SIZE, 0.0f));
+        std::vector<std::vector<float>> volcanicStressGrid(PARTICLE_GRID_SIZE, std::vector<float>(PARTICLE_GRID_SIZE, 0.0f));
 
+        // --- PASS 1: Calculate inter-particle forces, rifting, and determine collision type ---
 #pragma omp parallel for
         for (int i = 0; i < PARTICLE_GRID_SIZE; ++i) {
             for (int j = 0; j < PARTICLE_GRID_SIZE; ++j) {
@@ -519,7 +556,7 @@ private:
 #pragma omp atomic
                         forces[nx][ny].y -= spring_force.y;
 
-                        if (displacement < 0) {
+                        if (displacement < 0) { // Compression
                             float compression_depth = -displacement;
                             glm::vec3 pressure_force = -dir_vec * compression_depth * HORIZONTAL_PRESSURE_SCALE;
 
@@ -532,61 +569,113 @@ private:
 #pragma omp atomic
                             forces[nx][ny].y -= pressure_force.y;
 
-                            float base_thickness_to_add = compression_depth * THICKENING_RATE;
+                            float stress_energy = compression_depth * THICKENING_RATE;
 
-                            if (p.mass > neighbor.mass * DENSITY_DIFF_THRESHOLD) {
-                                float resistance = neighbor.crustThickness / THICKNESS_RESISTANCE_SCALE;
-                                float thickness_to_add = base_thickness_to_add * std::max(0.0f, 1.0f - resistance);
+                            const float DENSITY_SUBDUCTION_THRESHOLD = 1.02f;
+                            const float THICKNESS_SUBDUCTION_THRESHOLD = 0.75f;
+
+                            bool p_is_oceanic = p.mass > neighbor.mass * DENSITY_SUBDUCTION_THRESHOLD && p.crustThickness < neighbor.crustThickness * THICKNESS_SUBDUCTION_THRESHOLD;
+                            bool n_is_oceanic = neighbor.mass > p.mass * DENSITY_SUBDUCTION_THRESHOLD && neighbor.crustThickness < p.crustThickness * THICKNESS_SUBDUCTION_THRESHOLD;
+
+                            if (p_is_oceanic) { // P subducts under Neighbor
 #pragma omp atomic
-                                neighbor.crustThickness += thickness_to_add;
+                                m_particleGrid[i][j].subduction_pull += stress_energy * 50.0f;
+#pragma omp atomic
+                                continentalStressGrid[nx][ny] += stress_energy * 0.2f;
+                                glm::vec2 inland_dir = glm::normalize(glm::vec2(-dir.x, -dir.y));
+                                int vx = nx + static_cast<int>(inland_dir.x * 5);
+                                int vy = ny + static_cast<int>(inland_dir.y * 5);
+                                if (vx >= 0 && vx < PARTICLE_GRID_SIZE && vy >= 0 && vy < PARTICLE_GRID_SIZE) {
+#pragma omp atomic
+                                    volcanicStressGrid[vx][vy] += stress_energy * 1.5f;
+                                }
+
                             }
-                            else if (neighbor.mass > p.mass * DENSITY_DIFF_THRESHOLD) {
-                                float resistance = p.crustThickness / THICKNESS_RESISTANCE_SCALE;
-                                float thickness_to_add = base_thickness_to_add * std::max(0.0f, 1.0f - resistance);
+                            else if (n_is_oceanic) { // Neighbor subducts under P
 #pragma omp atomic
-                                p.crustThickness += thickness_to_add;
+                                m_particleGrid[nx][ny].subduction_pull += stress_energy * 50.0f;
+#pragma omp atomic
+                                continentalStressGrid[i][j] += stress_energy * 0.2f;
+                                glm::vec2 inland_dir = glm::normalize(glm::vec2(dir.x, dir.y));
+                                int vx = i + static_cast<int>(inland_dir.x * 5);
+                                int vy = j + static_cast<int>(inland_dir.y * 5);
+                                if (vx >= 0 && vx < PARTICLE_GRID_SIZE && vy >= 0 && vy < PARTICLE_GRID_SIZE) {
+#pragma omp atomic
+                                    volcanicStressGrid[vx][vy] += stress_energy * 1.5f;
+                                }
                             }
-                            else {
-                                float p_resistance = p.crustThickness / THICKNESS_RESISTANCE_SCALE;
-                                float n_resistance = neighbor.crustThickness / THICKNESS_RESISTANCE_SCALE;
-                                float p_thickness_to_add = base_thickness_to_add * 0.5f * std::max(0.0f, 1.0f - p_resistance);
-                                float n_thickness_to_add = base_thickness_to_add * 0.5f * std::max(0.0f, 1.0f - n_resistance);
+                            else { // Continental-Continental Collision
 #pragma omp atomic
-                                p.crustThickness += p_thickness_to_add;
+                                continentalStressGrid[i][j] += stress_energy * 0.8f;
 #pragma omp atomic
-                                neighbor.crustThickness += n_thickness_to_add;
+                                continentalStressGrid[nx][ny] += stress_energy * 0.8f;
                             }
+                        }
+                        else if (displacement > 0.1f) { // Extension
+                            float thinning_amount = displacement * RIFTING_THINNING_RATE;
+#pragma omp atomic
+                            m_particleGrid[i][j].crustThickness -= thinning_amount;
+#pragma omp atomic
+                            m_particleGrid[nx][ny].crustThickness -= thinning_amount;
+
+                            if (m_particleGrid[i][j].crustThickness < MIN_CRUST_THICKNESS) m_particleGrid[i][j].crustThickness = MIN_CRUST_THICKNESS;
+                            if (m_particleGrid[nx][ny].crustThickness < MIN_CRUST_THICKNESS) m_particleGrid[nx][ny].crustThickness = MIN_CRUST_THICKNESS;
                         }
                     }
                 }
             }
         }
-        updatePositions(dt, forces);
-    }
 
-    void simulateStep_Isostasy(float dt) {
-        std::vector<std::vector<glm::vec3>> forces(PARTICLE_GRID_SIZE, std::vector<glm::vec3>(PARTICLE_GRID_SIZE, glm::vec3(0.0f)));
-
-        const float DAMPING_COEFFICIENT = 2.0f;
-        const float ISOSTATIC_REBOUND_SCALE = 0.2f;
+        // --- PASS 2: Propagate stress and apply thickening, considering fault reactivation ---
+        const int stress_radius = 5;
+        const float FAULT_REACTIVATION_FACTOR = 2.0f;
 
 #pragma omp parallel for
         for (int i = 0; i < PARTICLE_GRID_SIZE; ++i) {
             for (int j = 0; j < PARTICLE_GRID_SIZE; ++j) {
-                Particle& p = m_particleGrid[i][j];
-                if (p.plateID == -1) continue;
+                float total_continental_stress = 0.0f;
+                float total_volcanic_stress = 0.0f;
+                float total_weight = 0.0f;
 
-                float target_z = getIsostaticEquilibriumZ(p);
-
-                if (m_faultZoneMap[i][j] > 0.0f) {
-                    float fault_influence = m_faultZoneMap[i][j];
-                    target_z -= fault_influence * 20.0f * p.cohesion;
+                for (int y = -stress_radius; y <= stress_radius; ++y) {
+                    for (int x = -stress_radius; x <= stress_radius; ++x) {
+                        int ni = i + x;
+                        int nj = j + y;
+                        if (ni >= 0 && ni < PARTICLE_GRID_SIZE && nj >= 0 && nj < PARTICLE_GRID_SIZE) {
+                            float dist_sq = x * x + y * y;
+                            if (dist_sq <= stress_radius * stress_radius) {
+                                float weight = 1.0f / (1.0f + dist_sq);
+                                total_continental_stress += continentalStressGrid[ni][nj] * weight;
+                                total_volcanic_stress += volcanicStressGrid[ni][nj] * weight;
+                                total_weight += weight;
+                            }
+                        }
+                    }
                 }
 
-                forces[i][j].z += (target_z - p.position.z) * ISOSTATIC_REBOUND_SCALE;
-                forces[i][j] -= p.velocity * DAMPING_COEFFICIENT;
+                if (total_weight > 0) {
+                    float final_stress = (total_continental_stress + total_volcanic_stress) / total_weight;
+                    Particle& p = m_particleGrid[i][j];
+
+                    float deformability = 1.0f - p.rigidity;
+                    float thickness_resistance = 1.0f - std::min(1.0f, p.crustThickness / MAX_CRUST_THICKNESS);
+                    float thickness_to_add = final_stress * deformability * thickness_resistance;
+
+                    if (m_currentState == TECTONICS_REACTIVATION) {
+                        float fault_reactivation_mod = 1.0f + m_faultZoneMap[i][j] * FAULT_REACTIVATION_FACTOR;
+                        thickness_to_add *= fault_reactivation_mod;
+                    }
+
+                    p.crustThickness += thickness_to_add;
+
+                    const float MAX_ADDITIONAL_RIGIDITY = 0.2f;
+                    float thickness_ratio = std::min(1.0f, p.crustThickness / MAX_CRUST_THICKNESS);
+                    p.rigidity = p.initial_rigidity + MAX_ADDITIONAL_RIGIDITY * thickness_ratio;
+                    p.rigidity = std::min(p.rigidity, 0.95f);
+                }
             }
         }
+
         updatePositions(dt, forces);
     }
 };
